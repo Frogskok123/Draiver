@@ -17,29 +17,29 @@ jobs:
             android_version: "11"
             branch: "android11-5.4"
             ndk_version: "r23c"
-            
+
           - kernel_version: "5.10"
             android_version: "12"
             branch: "android12-5.10"
             ndk_version: "r25c"
-            
+
           - kernel_version: "5.15"
             android_version: "13"
             branch: "android13-5.15"
             ndk_version: "r26d"
-            
+
           - kernel_version: "6.1"
             android_version: "14"
             branch: "android14-6.1"
             ndk_version: "r27"
-            
+
           - kernel_version: "6.6"
             android_version: "15"
             branch: "android15-6.6"
             ndk_version: "r27"
 
     name: Build Kernel ${{ matrix.kernel_version }}
-    
+
     steps:
     - name: Free Disk Space
       run: |
@@ -74,23 +74,22 @@ jobs:
     - name: Prepare Driver Makefile
       run: |
         cd driver-src
-        # Создаем Makefile для OOT сборки
         cat > Makefile << 'EOF'
         obj-m += jiangnight.o
         jiangnight-objs := entry.o
-        
+
         # Flags
         ccflags-y := -Wno-error=implicit-function-declaration
         ccflags-y += -Wno-error=incompatible-pointer-types
         ccflags-y += -Wno-error=int-conversion
         ccflags-y += -fno-sanitize=cfi
         ccflags-y += -fno-sanitize=cfi-icall
-        
+
         all:
-        \tmake -C $(KERNEL_SRC) M=$(PWD) modules
-        
+        	make -C $(KERNEL_SRC) M=$(PWD) modules
+
         clean:
-        \tmake -C $(KERNEL_SRC) M=$(PWD) clean
+        	make -C $(KERNEL_SRC) M=$(PWD) clean
         EOF
 
     - name: Configure Kernel
@@ -99,14 +98,12 @@ jobs:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
+        CROSS_COMPILE: aarch64-linux-android-
+        CLANG_TRIPLE: aarch64-linux-gnu-
       run: |
-        # Используем V=1 для подробного лога ошибок
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
-        
-        # Важно: для External Modules не нужно править .config ядра!
-        # Достаточно подготовить modules_prepare
-        
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS modules_prepare
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS           CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE           gki_defconfig
+
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS           CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE           modules_prepare
 
     - name: Build Module
       working-directory: gki-kernel
@@ -114,23 +111,25 @@ jobs:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
+        CROSS_COMPILE: aarch64-linux-android-
+        CLANG_TRIPLE: aarch64-linux-gnu-
       run: |
-        # Запускаем сборку, указывая путь к исходникам драйвера
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-          M=$GITHUB_WORKSPACE/driver-src \
-          modules
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS           CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE           M=$GITHUB_WORKSPACE/driver-src           modules
 
     - name: Verify Artifacts
       run: |
         MODULE_PATH=$(find driver-src -name "*.ko" -type f | head -n1)
         if [ -z "$MODULE_PATH" ]; then
-          echo "❌ Build failed - .ko file not found"
+          echo "Build failed - .ko file not found"
           exit 1
         fi
-        echo "✅ Built: $MODULE_PATH"
-        
+        echo "Built: $MODULE_PATH"
+
         mkdir -p artifacts
         cp "$MODULE_PATH" artifacts/jiangnight-${{ matrix.kernel_version }}.ko
+
+        # Strip info
+        $GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-debug artifacts/jiangnight-${{ matrix.kernel_version }}.ko
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -147,13 +146,13 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: modules
-      
+
       - name: Package
         run: |
           mkdir release
-          find modules -name "*.ko" -exec cp {} release/ ;
+          find modules -name "*.ko" -exec cp {} release/ \;
           ls -lh release/
-          
+
       - uses: actions/upload-artifact@v4
         with:
           name: all-modules
