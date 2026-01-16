@@ -10,7 +10,7 @@
 #include <linux/version.h>
 #include <asm/pgtable.h>
 #include <linux/highmem.h>
-
+#include <linux/slab.h>
 // ==========================================
 // ТРАНСЛЯЦИЯ (VIRT TO PHYS)
 // ==========================================
