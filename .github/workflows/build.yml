@@ -1,4 +1,4 @@
-name: Build GKI 5.10.136 Kernel Module
+name: Build Multi-Kernel GKI Modules
 
 on:
   push:
@@ -6,14 +6,59 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  build-matrix:
     runs-on: ubuntu-22.04
-    
+    strategy:
+      matrix:
+        include:
+          # Android 11 - Kernel 5.4
+          - kernel_version: "5.4"
+            android_version: "11"
+            branch: "android11-5.4"
+            ndk_version: "r23c"
+            clang_version: "12"
+
+          # Android 12 - Kernel 5.10
+          - kernel_version: "5.10"
+            android_version: "12"
+            branch: "android12-5.10"
+            ndk_version: "r25c"
+            clang_version: "14"
+
+          # Android 13 - Kernel 5.15
+          - kernel_version: "5.15"
+            android_version: "13"
+            branch: "android13-5.15"
+            ndk_version: "r26d"
+            clang_version: "17"
+
+          # Android 14 - Kernel 6.1
+          - kernel_version: "6.1"
+            android_version: "14"
+            branch: "android14-6.1"
+            ndk_version: "r27"
+            clang_version: "18"
+
+          # Android 15 - Kernel 6.6
+          - kernel_version: "6.6"
+            android_version: "15"
+            branch: "android15-6.6"
+            ndk_version: "r27"
+            clang_version: "18"
+
+    name: Build for Kernel ${{ matrix.kernel_version }} (Android ${{ matrix.android_version }})
+
     steps:
     - name: Checkout driver source
       uses: actions/checkout@v4
       with:
         path: driver-src
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+        sudo apt-get clean
+        df -h
 
     - name: Install dependencies
       run: |
@@ -21,38 +66,40 @@ jobs:
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
                                 python3 python3-pip git wget lld llvm
 
-    - name: Setup Android NDK
+    - name: Setup Android NDK ${{ matrix.ndk_version }}
       run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        unzip -q android-ndk-r25c-linux.zip
-        # Добавляем путь к clang и инструментам llvm из NDK
-        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        wget -q https://dl.google.com/android/repository/android-ndk-${{ matrix.ndk_version }}-linux.zip
+        unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
+        echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    - name: Clone GKI kernel
+    - name: Clone GKI kernel ${{ matrix.kernel_version }}
       run: |
-        git clone --depth 1 --branch android12-5.10 https://android.googlesource.com/kernel/common gki-kernel
+        git clone --depth 1 --branch ${{ matrix.branch }} \
+          https://android.googlesource.com/kernel/common gki-kernel
 
     - name: Integrate driver into kernel tree
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
-        
+        cp $GITHUB_WORKSPACE/driver-src/*.h $GITHUB_WORKSPACE/driver-src/*.c drivers/khack/ || true
+
         cat > drivers/khack/Kconfig <<-'EOF'
         config KERNEL_HACK
-            tristate "JiangNight Memory Hack Driver"
+            tristate "Memory Hack Driver for Kernel ${{ matrix.kernel_version }}"
             default m
         EOF
-        
+
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
-        jiangnight-objs := entry.o 
+        jiangnight-objs := entry.o
+        ccflags-y := -Wno-error=implicit-function-declaration
+        ccflags-y += -Wno-error=incompatible-pointer-types
         EOF
-        
+
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
-    - name: Configure and Build
+    - name: Configure and Build for ${{ matrix.kernel_version }}
       env:
         ARCH: arm64
         LLVM: 1
@@ -60,24 +107,63 @@ jobs:
         CROSS_COMPILE: aarch64-linux-android-
       run: |
         cd gki-kernel
-        # 1. Базовая конфигурация
+
+        # Базовая конфигурация
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
-        
-        # 2. Включение вашего модуля и обновление конфига
+
+        # Включение модуля
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
+
+        # Для kernel 5.4 могут потребоваться дополнительные опции
+        if [ "${{ matrix.kernel_version }}" = "5.4" ]; then
+          echo "CONFIG_ANDROID_KABI_RESERVE=y" >> out/.config
+        fi
+
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
-        
-        # 3. Подготовка к сборке модулей
+
+        # Подготовка к сборке модулей
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
-        
-        # 4. Сборка конкретно вашего модуля
+
+        # Сборка модуля
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
 
-    - name: Upload module
+    - name: Verify module
+      run: |
+        MODULE_PATH=$(find gki-kernel/out -name "jiangnight.ko" -type f)
+        if [ -z "$MODULE_PATH" ]; then
+          echo "❌ Module not found!"
+          exit 1
+        fi
+        echo "✅ Module built: $MODULE_PATH"
+        file "$MODULE_PATH"
+        ls -lh "$MODULE_PATH"
+
+    - name: Upload module artifact
       uses: actions/upload-artifact@v4
       with:
-        name: jiangnight-5.10.136.ko
-        # Использование маски помогает найти файл, если структура out изменится
+        name: jiangnight-kernel${{ matrix.kernel_version }}-android${{ matrix.android_version }}.ko
         path: gki-kernel/out/**/jiangnight.ko
         if-no-files-found: error
 
+  # Опциональный job для создания release
+  create-release:
+    needs: build-matrix
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+
+    - name: Create release package
+      run: |
+        mkdir -p release
+        find . -name "*.ko" -exec cp {} release/ \;
+        cd release
+        ls -lah
+
+    - name: Upload release package
+      uses: actions/upload-artifact@v4
+      with:
+        name: all-kernel-modules
+        path: release/
