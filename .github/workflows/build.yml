@@ -1,4 +1,4 @@
-name: Build Multi-Kernel GKI Modules
+name: Build Multi-Kernel GKI Modules (Optimized)
 
 on:
   push:
@@ -8,7 +8,9 @@ on:
 jobs:
   build-matrix:
     runs-on: ubuntu-22.04
+    timeout-minutes: 120
     strategy:
+      fail-fast: false
       matrix:
         include:
           # Android 11 - Kernel 5.4
@@ -16,154 +18,263 @@ jobs:
             android_version: "11"
             branch: "android11-5.4"
             ndk_version: "r23c"
-            clang_version: "12"
-
+            
           # Android 12 - Kernel 5.10
           - kernel_version: "5.10"
             android_version: "12"
             branch: "android12-5.10"
             ndk_version: "r25c"
-            clang_version: "14"
-
+            
           # Android 13 - Kernel 5.15
           - kernel_version: "5.15"
             android_version: "13"
             branch: "android13-5.15"
             ndk_version: "r26d"
-            clang_version: "17"
-
+            
           # Android 14 - Kernel 6.1
           - kernel_version: "6.1"
             android_version: "14"
             branch: "android14-6.1"
             ndk_version: "r27"
-            clang_version: "18"
-
+            
           # Android 15 - Kernel 6.6
           - kernel_version: "6.6"
             android_version: "15"
             branch: "android15-6.6"
             ndk_version: "r27"
-            clang_version: "18"
 
-    name: Build for Kernel ${{ matrix.kernel_version }} (Android ${{ matrix.android_version }})
-
+    name: Build Kernel ${{ matrix.kernel_version }}
+    
     steps:
+    - name: Maximize build space
+      run: |
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+        sudo docker image prune --all --force
+        sudo apt-get clean
+        df -h
+
     - name: Checkout driver source
       uses: actions/checkout@v4
       with:
         path: driver-src
 
-    - name: Free disk space
+    - name: Install build dependencies
       run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo apt-get clean
-        df -h
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq build-essential bc bison flex libssl-dev \
+                                    libelf-dev lld llvm git wget
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential bc bison flex libssl-dev \
-                                python3 python3-pip git wget lld llvm
+    - name: Cache NDK
+      id: cache-ndk
+      uses: actions/cache@v4
+      with:
+        path: android-ndk-${{ matrix.ndk_version }}
+        key: ndk-${{ matrix.ndk_version }}-${{ runner.os }}
 
-    - name: Setup Android NDK ${{ matrix.ndk_version }}
+    - name: Download NDK (if not cached)
+      if: steps.cache-ndk.outputs.cache-hit != 'true'
       run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-${{ matrix.ndk_version }}-linux.zip
+        wget -q --show-progress --progress=bar:force:noscroll \
+          https://dl.google.com/android/repository/android-ndk-${{ matrix.ndk_version }}-linux.zip
         unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
+        rm android-ndk-${{ matrix.ndk_version }}-linux.zip
+
+    - name: Setup NDK environment
+      run: |
         echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    - name: Clone GKI kernel ${{ matrix.kernel_version }}
+    - name: Clone GKI kernel (with retry and timeout)
+      timeout-minutes: 30
       run: |
-        git clone --depth 1 --branch ${{ matrix.branch }} \
-          https://android.googlesource.com/kernel/common gki-kernel
+        # Функция для клонирования с повторами
+        clone_with_retry() {
+          local max_attempts=3
+          local timeout=900  # 15 минут
+          local attempt=1
+          
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt of $max_attempts..."
+            
+            timeout $timeout git clone --depth 1 \
+              --single-branch --branch ${{ matrix.branch }} \
+              --filter=blob:none \
+              https://android.googlesource.com/kernel/common gki-kernel && break
+            
+            echo "Clone failed, cleaning up..."
+            rm -rf gki-kernel
+            attempt=$((attempt + 1))
+            
+            if [ $attempt -le $max_attempts ]; then
+              echo "Waiting 10 seconds before retry..."
+              sleep 10
+            fi
+          done
+          
+          if [ ! -d gki-kernel ]; then
+            echo "Failed to clone after $max_attempts attempts"
+            exit 1
+          fi
+        }
+        
+        clone_with_retry
 
     - name: Integrate driver into kernel tree
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        cp $GITHUB_WORKSPACE/driver-src/*.h $GITHUB_WORKSPACE/driver-src/*.c drivers/khack/ || true
-
-        cat > drivers/khack/Kconfig <<-'EOF'
+        
+        # Копируем файлы драйвера
+        cp $GITHUB_WORKSPACE/driver-src/*.h drivers/khack/ 2>/dev/null || true
+        cp $GITHUB_WORKSPACE/driver-src/*.c drivers/khack/ 2>/dev/null || true
+        
+        # Kconfig
+        cat > drivers/khack/Kconfig <<'EOF'
         config KERNEL_HACK
-            tristate "Memory Hack Driver for Kernel ${{ matrix.kernel_version }}"
+            tristate "Memory Access Driver"
             default m
+            help
+              Kernel memory access driver for Android GKI
         EOF
-
-        cat > drivers/khack/Makefile <<-'EOF'
+        
+        # Makefile с CFI совместимостью
+        cat > drivers/khack/Makefile <<'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o
+
+        # Подавление warning'ов для совместимости
         ccflags-y := -Wno-error=implicit-function-declaration
         ccflags-y += -Wno-error=incompatible-pointer-types
+        ccflags-y += -Wno-error=int-conversion
+        
+        # CFI совместимость для GKI
+        ccflags-y += -fno-sanitize=cfi
+        ccflags-y += -fno-sanitize=cfi-icall
         EOF
-
+        
+        # Интеграция в kernel build system
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
-        echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
+        sed -i '/^obj-y.*+= virt/$/a obj-$(CONFIG_KERNEL_HACK) += khack/' drivers/Makefile
 
-    - name: Configure and Build for ${{ matrix.kernel_version }}
+    - name: Configure kernel
+      working-directory: gki-kernel
       env:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
-        CROSS_COMPILE: aarch64-linux-android-
       run: |
-        cd gki-kernel
-
-        # Базовая конфигурация
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
-
-        # Включение модуля
+        
+        # Включаем наш модуль
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
-
-        # Для kernel 5.4 могут потребоваться дополнительные опции
-        if [ "${{ matrix.kernel_version }}" = "5.4" ]; then
-          echo "CONFIG_ANDROID_KABI_RESERVE=y" >> out/.config
-        fi
-
+        
+        # Дополнительные опции для совместимости
+        echo "CONFIG_ANDROID_KABI_RESERVE=y" >> out/.config
+        
+        # Обновляем конфиг
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
 
-        # Подготовка к сборке модулей
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
-
-        # Сборка модуля
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
-
-    - name: Verify module
+    - name: Prepare for module build
+      working-directory: gki-kernel
+      env:
+        ARCH: arm64
+        LLVM: 1
+        LLVM_IAS: 1
       run: |
-        MODULE_PATH=$(find gki-kernel/out -name "jiangnight.ko" -type f)
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+          -j$(nproc) modules_prepare
+
+    - name: Build kernel module
+      working-directory: gki-kernel
+      env:
+        ARCH: arm64
+        LLVM: 1
+        LLVM_IAS: 1
+      run: |
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
+          -j$(nproc) M=drivers/khack
+
+    - name: Verify and strip module
+      run: |
+        MODULE_PATH=$(find gki-kernel/out -name "jiangnight.ko" -type f | head -n1)
+        
         if [ -z "$MODULE_PATH" ]; then
           echo "❌ Module not found!"
+          find gki-kernel/out -name "*.ko" -type f
           exit 1
         fi
-        echo "✅ Module built: $MODULE_PATH"
+        
+        echo "✅ Module built successfully!"
+        echo "Path: $MODULE_PATH"
         file "$MODULE_PATH"
         ls -lh "$MODULE_PATH"
+        
+        # Strip для уменьшения размера
+        $GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
+          "$MODULE_PATH" || true
+        
+        # Копируем в удобное место
+        mkdir -p artifacts
+        cp "$MODULE_PATH" artifacts/jiangnight-${{ matrix.kernel_version }}.ko
+        
+        echo "Final size:"
+        ls -lh artifacts/jiangnight-${{ matrix.kernel_version }}.ko
 
     - name: Upload module artifact
       uses: actions/upload-artifact@v4
       with:
-        name: jiangnight-kernel${{ matrix.kernel_version }}-android${{ matrix.android_version }}.ko
-        path: gki-kernel/out/**/jiangnight.ko
+        name: jiangnight-kernel-${{ matrix.kernel_version }}
+        path: artifacts/*.ko
         if-no-files-found: error
+        compression-level: 9
 
-  # Опциональный job для создания release
-  create-release:
+  # Создание единого релиза со всеми модулями
+  create-release-package:
     needs: build-matrix
     runs-on: ubuntu-22.04
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
+    if: success()
+    
     steps:
-    - name: Download all artifacts
+    - name: Download all kernel modules
       uses: actions/download-artifact@v4
-
+      with:
+        path: all-modules
+        
     - name: Create release package
       run: |
-        mkdir -p release
-        find . -name "*.ko" -exec cp {} release/ \;
-        cd release
+        mkdir -p release-package
+        
+        # Копируем все .ko файлы
+        find all-modules -name "*.ko" -exec cp {} release-package/ ;
+        
+        # Создаем README
+        cat > release-package/README.md <<'EOF'
+        # Kernel Modules for Multiple Android GKI Versions
+        
+        ## Available Modules:
+        - jiangnight-5.4.ko  - Android 11 (Kernel 5.4)
+        - jiangnight-5.10.ko - Android 12 (Kernel 5.10)
+        - jiangnight-5.15.ko - Android 13 (Kernel 5.15)
+        - jiangnight-6.1.ko  - Android 14 (Kernel 6.1)
+        - jiangnight-6.6.ko  - Android 15 (Kernel 6.6)
+        
+        ## Installation:
+        1. Choose the correct .ko for your Android version
+        2. Push to device: adb push jiangnight-X.X.ko /data/local/tmp/
+        3. Load module: insmod /data/local/tmp/jiangnight-X.X.ko
+        
+        ## Features:
+        - Read/Write process memory (OP_READ_MEM, OP_WRITE_MEM)
+        - Get module base address (OP_MODULE_BASE)
+        - DKOM stealth (hidden from lsmod)
+        - Multi-kernel compatibility (5.4 - 6.6)
+        EOF
+        
+        cd release-package
         ls -lah
-
-    - name: Upload release package
+        
+    - name: Upload complete package
       uses: actions/upload-artifact@v4
       with:
-        name: all-kernel-modules
-        path: release/
+        name: all-kernel-modules-package
+        path: release-package/
+        compression-level: 9
