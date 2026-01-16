@@ -1,4 +1,4 @@
-name: Build GKI Modules (External)
+name: Build GKI Modules (Final Fix)
 
 on:
   push:
@@ -71,9 +71,19 @@ jobs:
       run: |
         git clone --depth 1 --branch ${{ matrix.branch }} --filter=blob:none https://android.googlesource.com/kernel/common gki-kernel
 
-    - name: Prepare Driver Makefile
+    - name: Prepare Driver Sources
       run: |
         cd driver-src
+
+        # Убедимся, что файлы существуют
+        ls -la
+
+        # Если файлы лежат во вложенной папке kernel/, переместим их
+        if [ -d "kernel" ]; then
+          cp kernel/* .
+        fi
+
+        # Создаем Makefile
         cat > Makefile << 'EOF'
         obj-m += jiangnight.o
         jiangnight-objs := entry.o
@@ -91,6 +101,13 @@ jobs:
         clean:
         	make -C $(KERNEL_SRC) M=$(PWD) clean
         EOF
+
+        # Проверяем наличие entry.c перед сборкой
+        if [ ! -f "entry.c" ]; then
+          echo "❌ ERROR: entry.c not found in driver-src!"
+          ls -R
+          exit 1
+        fi
 
     - name: Configure Kernel
       working-directory: gki-kernel
@@ -121,6 +138,7 @@ jobs:
         MODULE_PATH=$(find driver-src -name "*.ko" -type f | head -n1)
         if [ -z "$MODULE_PATH" ]; then
           echo "Build failed - .ko file not found"
+          find driver-src -name "*.o"
           exit 1
         fi
         echo "Built: $MODULE_PATH"
@@ -128,7 +146,6 @@ jobs:
         mkdir -p artifacts
         cp "$MODULE_PATH" artifacts/jiangnight-${{ matrix.kernel_version }}.ko
 
-        # Strip info
         $GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-debug artifacts/jiangnight-${{ matrix.kernel_version }}.ko
 
     - name: Upload Artifact
