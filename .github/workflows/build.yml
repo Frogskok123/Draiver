@@ -1,4 +1,4 @@
-name: Build Multi-Kernel GKI Modules (Optimized)
+name: Build Multi-Kernel GKI Modules
 
 on:
   push:
@@ -83,17 +83,16 @@ jobs:
       run: |
         echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    - name: Clone GKI kernel (with retry and timeout)
+    - name: Clone GKI kernel (with retry)
       timeout-minutes: 30
       run: |
-        # Функция для клонирования с повторами
         clone_with_retry() {
           local max_attempts=3
-          local timeout=900  # 15 минут
+          local timeout=900
           local attempt=1
           
           while [ $attempt -le $max_attempts ]; do
-            echo "Attempt $attempt of $max_attempts..."
+            echo "Clone attempt $attempt of $max_attempts..."
             
             timeout $timeout git clone --depth 1 \
               --single-branch --branch ${{ matrix.branch }} \
@@ -127,33 +126,33 @@ jobs:
         cp $GITHUB_WORKSPACE/driver-src/*.h drivers/khack/ 2>/dev/null || true
         cp $GITHUB_WORKSPACE/driver-src/*.c drivers/khack/ 2>/dev/null || true
         
-        # Kconfig
-        cat > drivers/khack/Kconfig <<'EOF'
-        config KERNEL_HACK
-            tristate "Memory Access Driver"
-            default m
-            help
-              Kernel memory access driver for Android GKI
-        EOF
+        # Создаем Kconfig
+        cat > drivers/khack/Kconfig <<'KCONFIG_EOF'
+config KERNEL_HACK
+    tristate "Memory Access Driver"
+    default m
+    help
+      Kernel memory access driver for Android GKI
+KCONFIG_EOF
         
-        # Makefile с CFI совместимостью
-        cat > drivers/khack/Makefile <<'EOF'
-        obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
-        jiangnight-objs := entry.o
+        # Создаем Makefile с CFI bypass
+        cat > drivers/khack/Makefile <<'MAKEFILE_EOF'
+obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
+jiangnight-objs := entry.o
 
-        # Подавление warning'ов для совместимости
-        ccflags-y := -Wno-error=implicit-function-declaration
-        ccflags-y += -Wno-error=incompatible-pointer-types
-        ccflags-y += -Wno-error=int-conversion
-        
-        # CFI совместимость для GKI
-        ccflags-y += -fno-sanitize=cfi
-        ccflags-y += -fno-sanitize=cfi-icall
-        EOF
+# Подавление warning'ов для совместимости
+ccflags-y := -Wno-error=implicit-function-declaration
+ccflags-y += -Wno-error=incompatible-pointer-types
+ccflags-y += -Wno-error=int-conversion
+
+# CFI bypass для GKI
+ccflags-y += -fno-sanitize=cfi
+ccflags-y += -fno-sanitize=cfi-icall
+MAKEFILE_EOF
         
         # Интеграция в kernel build system
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
-        sed -i '/^obj-y.*+= virt/$/a obj-$(CONFIG_KERNEL_HACK) += khack/' drivers/Makefile
+        echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
     - name: Configure kernel
       working-directory: gki-kernel
@@ -164,13 +163,9 @@ jobs:
       run: |
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # Включаем наш модуль
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
-        
-        # Дополнительные опции для совместимости
         echo "CONFIG_ANDROID_KABI_RESERVE=y" >> out/.config
         
-        # Обновляем конфиг
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
 
     - name: Prepare for module build
@@ -208,11 +203,11 @@ jobs:
         file "$MODULE_PATH"
         ls -lh "$MODULE_PATH"
         
-        # Strip для уменьшения размера
+        # Strip модуля для уменьшения размера
         $GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip \
           "$MODULE_PATH" || true
         
-        # Копируем в удобное место
+        # Копируем в artifacts
         mkdir -p artifacts
         cp "$MODULE_PATH" artifacts/jiangnight-${{ matrix.kernel_version }}.ko
         
@@ -227,7 +222,6 @@ jobs:
         if-no-files-found: error
         compression-level: 9
 
-  # Создание единого релиза со всеми модулями
   create-release-package:
     needs: build-matrix
     runs-on: ubuntu-22.04
@@ -242,32 +236,39 @@ jobs:
     - name: Create release package
       run: |
         mkdir -p release-package
-        
-        # Копируем все .ko файлы
         find all-modules -name "*.ko" -exec cp {} release-package/ ;
         
-        # Создаем README
-        cat > release-package/README.md <<'EOF'
-        # Kernel Modules for Multiple Android GKI Versions
-        
-        ## Available Modules:
-        - jiangnight-5.4.ko  - Android 11 (Kernel 5.4)
-        - jiangnight-5.10.ko - Android 12 (Kernel 5.10)
-        - jiangnight-5.15.ko - Android 13 (Kernel 5.15)
-        - jiangnight-6.1.ko  - Android 14 (Kernel 6.1)
-        - jiangnight-6.6.ko  - Android 15 (Kernel 6.6)
-        
-        ## Installation:
-        1. Choose the correct .ko for your Android version
-        2. Push to device: adb push jiangnight-X.X.ko /data/local/tmp/
-        3. Load module: insmod /data/local/tmp/jiangnight-X.X.ko
-        
-        ## Features:
-        - Read/Write process memory (OP_READ_MEM, OP_WRITE_MEM)
-        - Get module base address (OP_MODULE_BASE)
-        - DKOM stealth (hidden from lsmod)
-        - Multi-kernel compatibility (5.4 - 6.6)
-        EOF
+        cat > release-package/README.md <<'README_EOF'
+# Kernel Modules for Multiple Android GKI Versions
+
+## Available Modules:
+- jiangnight-5.4.ko  - Android 11 (Kernel 5.4)
+- jiangnight-5.10.ko - Android 12 (Kernel 5.10)
+- jiangnight-5.15.ko - Android 13 (Kernel 5.15)
+- jiangnight-6.1.ko  - Android 14 (Kernel 6.1)
+- jiangnight-6.6.ko  - Android 15 (Kernel 6.6)
+
+## Installation:
+1. Choose the correct .ko for your Android version
+2. Push to device: `adb push jiangnight-X.X.ko /data/local/tmp/`
+3. Load module: `su -c "insmod /data/local/tmp/jiangnight-X.X.ko"`
+
+## Features:
+- Read/Write process memory (OP_READ_MEM, OP_WRITE_MEM)
+- Get module base address (OP_MODULE_BASE)
+- DKOM stealth (hidden from lsmod)
+- Multi-kernel compatibility (5.4 - 6.6)
+- CFI bypass included
+
+## Technical Details:
+- Kernel CFI bypass enabled
+- DKOM hiding from lsmod/sysfs
+- Page-level memory access
+- VMA-based module enumeration
+- Multi-version kernel API compatibility
+
+Built with ❤️ for research purposes only
+README_EOF
         
         cd release-package
         ls -lah
