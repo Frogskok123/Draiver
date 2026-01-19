@@ -1,4 +1,4 @@
-name: Build GKI Modules (Stack Fix)
+name: Build GKI 5.10.136 Kernel Module
 
 on:
   push:
@@ -6,177 +6,78 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-matrix:
+  build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - kernel_version: "5.4"
-            android_version: "11"
-            branch: "android11-5.4"
-            ndk_version: "r23c"
-            
-          - kernel_version: "5.10"
-            android_version: "12"
-            branch: "android12-5.10"
-            ndk_version: "r25c"
-            
-          - kernel_version: "5.15"
-            android_version: "13"
-            branch: "android13-5.15"
-            ndk_version: "r26d"
-            
-          - kernel_version: "6.1"
-            android_version: "14"
-            branch: "android14-6.1"
-            ndk_version: "r27"
-            
-          - kernel_version: "6.6"
-            android_version: "15"
-            branch: "android15-6.6"
-            ndk_version: "r27"
-
-    name: Build Kernel ${{ matrix.kernel_version }}
     
     steps:
-    - name: Free Disk Space
-      run: |
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-        sudo apt-get clean
-        df -h
-
-    - name: Checkout Driver
+    - name: Checkout driver source
       uses: actions/checkout@v4
       with:
         path: driver-src
 
-    - name: Install Dependencies
+    - name: Install dependencies
       run: |
-        sudo apt-get update -qq
-        sudo apt-get install -y -qq build-essential bc bison flex libssl-dev libelf-dev lld llvm git wget dwarves
+        sudo apt-get update
+        sudo apt-get install -y build-essential bc bison flex libssl-dev \
+                                python3 python3-pip git wget lld llvm
 
-    - name: Setup NDK
-      id: setup-ndk
+    - name: Setup Android NDK
       run: |
-        if [ ! -d "android-ndk-${{ matrix.ndk_version }}" ]; then
-          wget -q https://dl.google.com/android/repository/android-ndk-${{ matrix.ndk_version }}-linux.zip
-          unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
-        fi
-        echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+        unzip -q android-ndk-r25c-linux.zip
+        # Добавляем путь к clang и инструментам llvm из NDK
+        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    - name: Clone Kernel
-      timeout-minutes: 30
+    - name: Clone GKI kernel
       run: |
-        git clone --depth 1 --branch ${{ matrix.branch }} --filter=blob:none https://android.googlesource.com/kernel/common gki-kernel
+        git clone --depth 1 --branch android12-5.10 https://android.googlesource.com/kernel/common gki-kernel
 
-    - name: Prepare Driver Sources
+    - name: Integrate driver into kernel tree
       run: |
-        cd driver-src
+        cd gki-kernel
+        mkdir -p drivers/khack
+        cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
         
-        if [ -d "kernel" ]; then cp kernel/* . ; fi
-        
-        # Обновленный Makefile с отключенным Stack Protector
-        cat > Makefile << 'EOF'
-        
-        MODULE_NAME := jiangnight
-        
-        ifneq ($(KERNELRELEASE),)
-            obj-m += $(MODULE_NAME).o
-            $(MODULE_NAME)-y := entry.o
-            
-            # Отключаем проверки безопасности, вызывающие ошибки линковки
-            ccflags-y := -Wno-error=implicit-function-declaration
-            ccflags-y += -Wno-error=incompatible-pointer-types
-            ccflags-y += -Wno-error=int-conversion
-            
-            # Fix: Unknown symbol __stack_chk_guard
-            ccflags-y += -fno-stack-protector
-            
-            # Fix: CFI errors
-            ccflags-y += -fno-sanitize=cfi
-            ccflags-y += -fno-sanitize=cfi-icall
-        else
-            KERNEL_SRC ?= /lib/modules/$(shell uname -r)/build
-            PWD := $(shell pwd)
-        
-        all:
-        \t$(MAKE) -C $(KERNEL_SRC) M=$(PWD) modules
-        
-        clean:
-        \t$(MAKE) -C $(KERNEL_SRC) M=$(PWD) clean
-        endif
+        cat > drivers/khack/Kconfig <<-'EOF'
+        config KERNEL_HACK
+            tristate "JiangNight Memory Hack Driver"
+            default m
         EOF
+        
+        cat > drivers/khack/Makefile <<-'EOF'
+        obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
+        jiangnight-objs := entry.o 
+        EOF
+        
+        echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
+        echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
-    - name: Configure Kernel
-      working-directory: gki-kernel
+    - name: Configure and Build
       env:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
         CROSS_COMPILE: aarch64-linux-android-
-        CLANG_TRIPLE: aarch64-linux-gnu-
       run: |
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-          CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
-          gki_defconfig
+        cd gki-kernel
+        # 1. Базовая конфигурация
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-          CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
-          modules_prepare
-
-    - name: Build Module
-      working-directory: gki-kernel
-      env:
-        ARCH: arm64
-        LLVM: 1
-        LLVM_IAS: 1
-        CROSS_COMPILE: aarch64-linux-android-
-        CLANG_TRIPLE: aarch64-linux-gnu-
-      run: |
-        DRIVER_PATH=$GITHUB_WORKSPACE/driver-src
+        # 2. Включение вашего модуля и обновление конфига
+        echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS \
-          CROSS_COMPILE=$CROSS_COMPILE CLANG_TRIPLE=$CLANG_TRIPLE \
-          M=$DRIVER_PATH \
-          modules
-
-    - name: Verify Artifacts
-      run: |
-        MODULE_PATH=$(find driver-src -name "*.ko" -type f | head -n1)
-        if [ -z "$MODULE_PATH" ]; then
-          echo "Build failed - .ko file not found"
-          exit 1
-        fi
-        echo "Built: $MODULE_PATH"
+        # 3. Подготовка к сборке модулей
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        mkdir -p artifacts
-        cp "$MODULE_PATH" artifacts/jiangnight-${{ matrix.kernel_version }}.ko
+        # 4. Сборка конкретно вашего модуля
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
 
-    - name: Upload Artifact
+    - name: Upload module
       uses: actions/upload-artifact@v4
       with:
-        name: jiangnight-${{ matrix.kernel_version }}
-        path: artifacts/*.ko
-        compression-level: 9
+        name: jiangnight-5.10.136.ko
+        # Использование маски помогает найти файл, если структура out изменится
+        path: gki-kernel/out/**/jiangnight.ko
+        if-no-files-found: error
 
-  create-release:
-    needs: build-matrix
-    runs-on: ubuntu-22.04
-    if: success()
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: modules
-      
-      - name: Package
-        run: |
-          mkdir release
-          find modules -name "*.ko" -exec cp {} release/ ;
-          ls -lh release/
-          
-      - uses: actions/upload-artifact@v4
-        with:
-          name: all-modules
-          path: release/
