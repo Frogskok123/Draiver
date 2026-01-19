@@ -1,4 +1,4 @@
-name: Build GKI 5.10.136 Kernel Module
+name: Build GKI Kernel Modules
 
 on:
   push:
@@ -8,7 +8,22 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kernel_version: "5.10"
+            android_branch: "android12-5.10"
+            ndk_version: "r25c"
+            ndk_url: "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
+            artifact_name: "jiangnight-5.10.ko"
+          
+          - kernel_version: "6.1"
+            android_branch: "android14-6.1"
+            ndk_version: "r26b"
+            ndk_url: "https://dl.google.com/android/repository/android-ndk-r26b-linux.zip"
+            artifact_name: "jiangnight-6.1.ko"
+
     steps:
     - name: Checkout driver source
       uses: actions/checkout@v4
@@ -19,24 +34,31 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
-                                python3 python3-pip git wget lld llvm
+                                python3 python3-pip git wget lld llvm \
+                                gcc-aarch64-linux-gnu
 
-    - name: Setup Android NDK
+    - name: Setup Android NDK (${{ matrix.ndk_version }})
       run: |
-        wget -q https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
-        unzip -q android-ndk-r25c-linux.zip
+        wget -q ${{ matrix.ndk_url }}
+        unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
         # Добавляем путь к clang и инструментам llvm из NDK
-        echo "$GITHUB_WORKSPACE/android-ndk-r25c/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+        echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    - name: Clone GKI kernel
+    - name: Clone GKI kernel (${{ matrix.kernel_version }})
       run: |
-        git clone --depth 1 --branch android12-5.10 https://android.googlesource.com/kernel/common gki-kernel
+        git clone --depth 1 --branch ${{ matrix.android_branch }} https://android.googlesource.com/kernel/common gki-kernel
 
     - name: Integrate driver into kernel tree
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/
+        
+        # Копируем исходники (предполагаем, что они в корне репозитория, либо в папке kernel/)
+        # Если файлы лежат прямо в корне репозитория (как вы присылали):
+        cp $GITHUB_WORKSPACE/driver-src/*.c drivers/khack/ || true
+        cp $GITHUB_WORKSPACE/driver-src/*.h drivers/khack/ || true
+        # Если файлы лежат в подпапке kernel:
+        # cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/ || true
         
         cat > drivers/khack/Kconfig <<-'EOF'
         config KERNEL_HACK
@@ -46,38 +68,42 @@ jobs:
         
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
-        jiangnight-objs := entry.o 
+        jiangnight-objs := entry.o
+        # Отключаем некоторые предупреждения, которые могут стать ошибками в новых ядрах
+        ccflags-y := -Wno-declaration-after-statement -Wno-unused-function
         EOF
         
+        # Регистрируем драйвер в системе сборки ядра
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
-    - name: Configure and Build
+    - name: Configure and Build (${{ matrix.kernel_version }})
+      working-directory: gki-kernel
       env:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
-        CROSS_COMPILE: aarch64-linux-android-
+        # Используем системный префикс binutils для совместимости, но компилятор будет Clang из NDK
+        CROSS_COMPILE: aarch64-linux-gnu-
       run: |
-        cd gki-kernel
-        # 1. Базовая конфигурация
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
+        # 1. Очистка и создание базового конфига GKI
+        make O=out mrproper
+        make O=out gki_defconfig
         
-        # 2. Включение вашего модуля и обновление конфига
-        echo "CONFIG_KERNEL_HACK=m" >> out/.config
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
+        # 2. Включение модуля в конфиг (безопасный метод)
+        ./scripts/config --file out/.config --enable CONFIG_KERNEL_HACK
+        make O=out olddefconfig
         
-        # 3. Подготовка к сборке модулей
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
+        # 3. Подготовка ядра
+        make O=out -j$(nproc) modules_prepare
         
-        # 4. Сборка конкретно вашего модуля
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
+        # 4. Сборка модуля
+        echo "Building module for kernel ${{ matrix.kernel_version }}..."
+        make O=out -j$(nproc) M=drivers/khack modules
 
-    - name: Upload module
+    - name: Upload module (${{ matrix.kernel_version }})
       uses: actions/upload-artifact@v4
       with:
-        name: jiangnight-5.10.136.ko
-        # Использование маски помогает найти файл, если структура out изменится
-        path: gki-kernel/out/**/jiangnight.ko
+        name: ${{ matrix.artifact_name }}
+        path: gki-kernel/out/drivers/khack/*.ko
         if-no-files-found: error
-
