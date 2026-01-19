@@ -153,8 +153,6 @@ jobs:
         
         mkdir -p artifacts
         cp "$MODULE_PATH" artifacts/jiangnight-${{ matrix.kernel_version }}.ko
-        
-        $GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-debug artifacts/jiangnight-${{ matrix.kernel_version }}.ko
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
