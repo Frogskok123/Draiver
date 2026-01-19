@@ -20,8 +20,8 @@ jobs:
           
           - kernel_version: "6.1"
             android_branch: "android14-6.1"
-            ndk_version: "r26b"
-            ndk_url: "https://dl.google.com/android/repository/android-ndk-r26b-linux.zip"
+            ndk_version: "r27"
+            ndk_url: "https://dl.google.com/android/repository/android-ndk-r27-linux.zip"
             artifact_name: "jiangnight-6.1.ko"
     
     steps:
@@ -35,7 +35,7 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y build-essential bc bison flex libssl-dev \
                                 python3 python3-pip git wget lld llvm \
-                                gcc-aarch64-linux-gnu
+                                gcc-aarch64-linux-gnu pahole dwarves
 
     - name: Setup Android NDK
       run: |
@@ -52,8 +52,6 @@ jobs:
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        # Вернул старый путь копирования из driver-src/kernel/*, как в вашем первом примере
-        # Если файлы лежат в корне репо, используйте cp $GITHUB_WORKSPACE/driver-src/* drivers/khack/
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/ || cp $GITHUB_WORKSPACE/driver-src/* drivers/khack/
         
         cat > drivers/khack/Kconfig <<-'EOF'
@@ -65,7 +63,7 @@ jobs:
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
-        ccflags-y := -Wno-declaration-after-statement
+        ccflags-y := -Wno-declaration-after-statement -Wno-unused-function
         EOF
         
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
@@ -84,6 +82,12 @@ jobs:
         
         # 2. Включение вашего модуля и обновление конфига
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        
+        # Для 6.1: отключаем некоторые проблемные опции, которые требуют vmlinux
+        if [[ "${{ matrix.kernel_version }}" == "6.1" ]]; then
+          echo "CONFIG_DEBUG_INFO_BTF=n" >> out/.config
+        fi
+        
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
         # 3. Подготовка к сборке модулей
@@ -96,6 +100,5 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        # Вернул маску поиска **, которая работала раньше
         path: gki-kernel/out/**/jiangnight.ko
         if-no-files-found: error
