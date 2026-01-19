@@ -41,7 +41,6 @@ jobs:
       run: |
         wget -q ${{ matrix.ndk_url }}
         unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
-        # Добавляем путь к clang
         echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
     - name: Clone GKI kernel
@@ -52,7 +51,7 @@ jobs:
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        # Копируем файлы
+        # Копируем исходники (поддержка обоих вариантов структуры репо)
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/ || cp $GITHUB_WORKSPACE/driver-src/* drivers/khack/
         
         cat > drivers/khack/Kconfig <<-'EOF'
@@ -61,7 +60,7 @@ jobs:
             default m
         EOF
         
-        # В Makefile добавляем -fno-stack-protector чтобы избежать ошибок линковки __stack_chk_guard
+        # -fno-stack-protector: отключаем проверку стека (канарейку), чтобы избежать ошибок линковки
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
@@ -76,22 +75,25 @@ jobs:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
-        CROSS_COMPILE: aarch64-linux-android-
+        # Используем системный GNU toolchain для binutils (ld, as), чтобы не зависеть от NDK путей
+        CROSS_COMPILE: aarch64-linux-gnu-
       run: |
         cd gki-kernel
-        # 1. Базовая конфигурация
-        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. Модификация конфига
-        # Отключаем защиту стека в конфиге ядра, если она мешает (для 6.1 часто нужно)
+        make O=out mrproper
+        make O=out gki_defconfig
+        
+        # --- Отключение защит, мешающих загрузке ---
         ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_STRONG
         ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_REGULAR
         ./scripts/config --file out/.config --enable CONFIG_CC_STACKPROTECTOR_NONE
+        # Отключаем проверку версий (может помочь при exec format error если версии не совпадают)
+        ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
         
-        # Включаем наш модуль
+        # --- Включение модуля ---
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         
-        # Отключаем BTF для 6.1 чтобы не требовался vmlinux и pahole не падал
+        # --- Специфика 6.1 ---
         if [[ "${{ matrix.kernel_version }}" == "6.1" ]]; then
           echo "CONFIG_DEBUG_INFO_BTF=n" >> out/.config
           echo "CONFIG_MODULE_ALLOW_BTF_MISMATCH=y" >> out/.config
@@ -99,15 +101,13 @@ jobs:
         
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # 3. Подготовка
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
-        
-        # 4. Сборка модуля
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
 
     - name: Upload module
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
+        # Ищем файл рекурсивно
         path: gki-kernel/out/**/jiangnight.ko
         if-no-files-found: error
