@@ -41,7 +41,6 @@ jobs:
       run: |
         wget -q ${{ matrix.ndk_url }}
         unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
-        # Добавляем путь к clang и инструментам llvm из NDK
         echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
     - name: Clone GKI kernel (${{ matrix.kernel_version }})
@@ -53,12 +52,9 @@ jobs:
         cd gki-kernel
         mkdir -p drivers/khack
         
-        # Копируем исходники (предполагаем, что они в корне репозитория, либо в папке kernel/)
-        # Если файлы лежат прямо в корне репозитория (как вы присылали):
+        # Копируем .c и .h из корня driver-src в drivers/khack
         cp $GITHUB_WORKSPACE/driver-src/*.c drivers/khack/ || true
         cp $GITHUB_WORKSPACE/driver-src/*.h drivers/khack/ || true
-        # Если файлы лежат в подпапке kernel:
-        # cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/ || true
         
         cat > drivers/khack/Kconfig <<-'EOF'
         config KERNEL_HACK
@@ -69,11 +65,9 @@ jobs:
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o
-        # Отключаем некоторые предупреждения, которые могут стать ошибками в новых ядрах
         ccflags-y := -Wno-declaration-after-statement -Wno-unused-function
         EOF
         
-        # Регистрируем драйвер в системе сборки ядра
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
@@ -83,27 +77,28 @@ jobs:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
-        # Используем системный префикс binutils для совместимости, но компилятор будет Clang из NDK
         CROSS_COMPILE: aarch64-linux-gnu-
       run: |
-        # 1. Очистка и создание базового конфига GKI
+        # 1. Конфигурация
         make O=out mrproper
         make O=out gki_defconfig
         
-        # 2. Включение модуля в конфиг (безопасный метод)
+        # 2. Включение модуля
         ./scripts/config --file out/.config --enable CONFIG_KERNEL_HACK
         make O=out olddefconfig
         
-        # 3. Подготовка ядра
+        # 3. Подготовка
         make O=out -j$(nproc) modules_prepare
         
-        # 4. Сборка модуля
-        echo "Building module for kernel ${{ matrix.kernel_version }}..."
+        # 4. Сборка
+        # Важно: При сборке с O=out, объектные файлы могут оказаться глубоко в структуре out
         make O=out -j$(nproc) M=drivers/khack modules
 
     - name: Upload module (${{ matrix.kernel_version }})
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        path: gki-kernel/out/drivers/khack/*.ko
+        # ВОССТАНОВЛЕНО: Используем ** для рекурсивного поиска jiangnight.ko в папке out
+        # Это найдет файл, где бы он ни лежал (out/drivers/khack/ или глубже)
+        path: gki-kernel/out/**/jiangnight.ko
         if-no-files-found: error
