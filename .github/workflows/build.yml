@@ -51,7 +51,6 @@ jobs:
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        # Копируем исходники (поддержка обоих вариантов структуры репо)
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/ || cp $GITHUB_WORKSPACE/driver-src/* drivers/khack/
         
         cat > drivers/khack/Kconfig <<-'EOF'
@@ -60,7 +59,9 @@ jobs:
             default m
         EOF
         
-        # -fno-stack-protector: отключаем проверку стека (канарейку), чтобы избежать ошибок линковки
+        # -fno-stack-protector: отключаем канарейку
+        # -mcmodel=large: иногда помогает при проблемах с адресацией, но обычно small/tiny достаточно для arm64.
+        # Оставим просто stack-protector off.
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
@@ -75,7 +76,6 @@ jobs:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
-        # Используем системный GNU toolchain для binutils (ld, as), чтобы не зависеть от NDK путей
         CROSS_COMPILE: aarch64-linux-gnu-
       run: |
         cd gki-kernel
@@ -83,17 +83,18 @@ jobs:
         make O=out mrproper
         make O=out gki_defconfig
         
-        # --- Отключение защит, мешающих загрузке ---
+        # --- Отключение проверок ---
         ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_STRONG
         ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_REGULAR
         ./scripts/config --file out/.config --enable CONFIG_CC_STACKPROTECTOR_NONE
-        # Отключаем проверку версий (может помочь при exec format error если версии не совпадают)
+        
+        # Отключаем контроль версий и CRC (важно для загрузки на другие сборки ядра)
         ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
+        ./scripts/config --file out/.config --enable CONFIG_MODULE_FORCE_LOAD
         
         # --- Включение модуля ---
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         
-        # --- Специфика 6.1 ---
         if [[ "${{ matrix.kernel_version }}" == "6.1" ]]; then
           echo "CONFIG_DEBUG_INFO_BTF=n" >> out/.config
           echo "CONFIG_MODULE_ALLOW_BTF_MISMATCH=y" >> out/.config
@@ -103,11 +104,14 @@ jobs:
         
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
+        
+        # --- Стрипинг (опционально, но полезно) ---
+        # Уменьшаем размер и убираем отладочную инфу, которая может конфликтовать
+        llvm-strip --strip-debug out/drivers/khack/jiangnight.ko
 
     - name: Upload module
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        # Ищем файл рекурсивно
         path: gki-kernel/out/**/jiangnight.ko
         if-no-files-found: error
