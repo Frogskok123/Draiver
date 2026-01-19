@@ -1,4 +1,4 @@
-name: Build GKI Kernel Modules
+name: Build GKI Kernel Module
 
 on:
   push:
@@ -16,14 +16,14 @@ jobs:
             android_branch: "android12-5.10"
             ndk_version: "r25c"
             ndk_url: "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
-            artifact_name: "jiangnight-5.10.ko"
+            artifact_name: "jiangnight-5.10.136.ko"
           
           - kernel_version: "6.1"
             android_branch: "android14-6.1"
             ndk_version: "r26b"
             ndk_url: "https://dl.google.com/android/repository/android-ndk-r26b-linux.zip"
             artifact_name: "jiangnight-6.1.ko"
-
+    
     steps:
     - name: Checkout driver source
       uses: actions/checkout@v4
@@ -37,13 +37,14 @@ jobs:
                                 python3 python3-pip git wget lld llvm \
                                 gcc-aarch64-linux-gnu
 
-    - name: Setup Android NDK (${{ matrix.ndk_version }})
+    - name: Setup Android NDK
       run: |
         wget -q ${{ matrix.ndk_url }}
         unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
+        # Добавляем путь к clang и инструментам llvm из NDK
         echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
-    - name: Clone GKI kernel (${{ matrix.kernel_version }})
+    - name: Clone GKI kernel
       run: |
         git clone --depth 1 --branch ${{ matrix.android_branch }} https://android.googlesource.com/kernel/common gki-kernel
 
@@ -51,10 +52,9 @@ jobs:
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
-        
-        # Копируем .c и .h из корня driver-src в drivers/khack
-        cp $GITHUB_WORKSPACE/driver-src/*.c drivers/khack/ || true
-        cp $GITHUB_WORKSPACE/driver-src/*.h drivers/khack/ || true
+        # Вернул старый путь копирования из driver-src/kernel/*, как в вашем первом примере
+        # Если файлы лежат в корне репо, используйте cp $GITHUB_WORKSPACE/driver-src/* drivers/khack/
+        cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/ || cp $GITHUB_WORKSPACE/driver-src/* drivers/khack/
         
         cat > drivers/khack/Kconfig <<-'EOF'
         config KERNEL_HACK
@@ -64,41 +64,38 @@ jobs:
         
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
-        jiangnight-objs := entry.o
-        ccflags-y := -Wno-declaration-after-statement -Wno-unused-function
+        jiangnight-objs := entry.o 
+        ccflags-y := -Wno-declaration-after-statement
         EOF
         
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
         echo 'obj-$(CONFIG_KERNEL_HACK) += khack/' >> drivers/Makefile
 
-    - name: Configure and Build (${{ matrix.kernel_version }})
-      working-directory: gki-kernel
+    - name: Configure and Build
       env:
         ARCH: arm64
         LLVM: 1
         LLVM_IAS: 1
-        CROSS_COMPILE: aarch64-linux-gnu-
+        CROSS_COMPILE: aarch64-linux-android-
       run: |
-        # 1. Конфигурация
-        make O=out mrproper
-        make O=out gki_defconfig
+        cd gki-kernel
+        # 1. Базовая конфигурация
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. Включение модуля
-        ./scripts/config --file out/.config --enable CONFIG_KERNEL_HACK
-        make O=out olddefconfig
+        # 2. Включение вашего модуля и обновление конфига
+        echo "CONFIG_KERNEL_HACK=m" >> out/.config
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # 3. Подготовка
-        make O=out -j$(nproc) modules_prepare
+        # 3. Подготовка к сборке модулей
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 4. Сборка
-        # Важно: При сборке с O=out, объектные файлы могут оказаться глубоко в структуре out
-        make O=out -j$(nproc) M=drivers/khack modules
+        # 4. Сборка конкретно вашего модуля
+        make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
 
-    - name: Upload module (${{ matrix.kernel_version }})
+    - name: Upload module
       uses: actions/upload-artifact@v4
       with:
         name: ${{ matrix.artifact_name }}
-        # ВОССТАНОВЛЕНО: Используем ** для рекурсивного поиска jiangnight.ko в папке out
-        # Это найдет файл, где бы он ни лежал (out/drivers/khack/ или глубже)
+        # Вернул маску поиска **, которая работала раньше
         path: gki-kernel/out/**/jiangnight.ko
         if-no-files-found: error
