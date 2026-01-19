@@ -1,4 +1,4 @@
-name: Build GKI Kernel Module (CFI Enabled)
+name: Build GKI Kernel Module (Final Fix)
 
 on:
   push:
@@ -20,8 +20,8 @@ jobs:
           
           - kernel_version: "6.1"
             android_branch: "android14-6.1"
-            # Ваша версия с телефона для подделки
-            fake_version: "6.1.57-android14-11-g792270e27ab1-ab11683491"
+            # Точный суффикс с вашего скриншота!
+            target_suffix: "-android14-11-g792270e27ab1-ab11683491"
             ndk_version: "r27"
             ndk_url: "https://dl.google.com/android/repository/android-ndk-r27-linux.zip"
             artifact_name: "jiangnight-6.1.ko"
@@ -61,7 +61,6 @@ jobs:
             default m
         EOF
         
-        # Добавляем флаги для Shadow Call Stack (SCS) и CFI, если они нужны
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
@@ -83,13 +82,9 @@ jobs:
         make O=out mrproper
         make O=out gki_defconfig
         
-        # --- ВКЛЮЧЕНИЕ CFI (для совместимости с GKI) ---
-        # GKI ядра (особенно 6.1) собраны с CFI_CLANG.
-        # Если модуль без CFI, он не сможет вызвать функции ядра (Exec format error или Crash).
+        # --- ВКЛЮЧЕНИЕ CFI (для 6.1 обязательно) ---
         ./scripts/config --file out/.config --enable CONFIG_CFI_CLANG
-        ./scripts/config --file out/.config --enable CONFIG_CFI_PERMISSIVE # Чтобы не крашило при ошибках
-        
-        # Также включаем Shadow Call Stack (SCS), часто используемый в Android
+        ./scripts/config --file out/.config --enable CONFIG_CFI_PERMISSIVE
         ./scripts/config --file out/.config --enable CONFIG_SHADOW_CALL_STACK
         
         # --- Отключение старых защит ---
@@ -107,10 +102,19 @@ jobs:
         
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # --- ПОДДЕЛКА ВЕРСИИ (ОБЯЗАТЕЛЬНО) ---
-        if [ ! -z "${{ matrix.fake_version }}" ]; then
+        # --- ПАТЧИМ ВЕРСИЮ ---
+        if [ ! -z "${{ matrix.target_suffix }}" ]; then
+            # 1. Форсируем базовую версию 6.1.57 (так как GKI в репо может быть новее, например 6.1.100)
             sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 57/' Makefile
-            sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION = -android14-11-g792270e27ab1-ab11683491/' Makefile
+            
+            # 2. Очищаем EXTRAVERSION в Makefile, чтобы не мешал
+            sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION =/' Makefile
+            
+            # 3. Добавляем суффикс через CONFIG_LOCALVERSION (самый надежный способ)
+            ./scripts/config --file out/.config --set-str CONFIG_LOCALVERSION "${{ matrix.target_suffix }}"
+            ./scripts/config --file out/.config --enable CONFIG_LOCALVERSION_AUTO
+            
+            # 4. Убираем метку "грязного" билда (+)
             echo "" > .scmversion
             touch .scmversion
         fi
