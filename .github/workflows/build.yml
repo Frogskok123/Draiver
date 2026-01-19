@@ -41,7 +41,7 @@ jobs:
       run: |
         wget -q ${{ matrix.ndk_url }}
         unzip -q android-ndk-${{ matrix.ndk_version }}-linux.zip
-        # Добавляем путь к clang и инструментам llvm из NDK
+        # Добавляем путь к clang
         echo "$GITHUB_WORKSPACE/android-ndk-${{ matrix.ndk_version }}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
 
     - name: Clone GKI kernel
@@ -52,6 +52,7 @@ jobs:
       run: |
         cd gki-kernel
         mkdir -p drivers/khack
+        # Копируем файлы
         cp $GITHUB_WORKSPACE/driver-src/kernel/* drivers/khack/ || cp $GITHUB_WORKSPACE/driver-src/* drivers/khack/
         
         cat > drivers/khack/Kconfig <<-'EOF'
@@ -60,10 +61,11 @@ jobs:
             default m
         EOF
         
+        # В Makefile добавляем -fno-stack-protector чтобы избежать ошибок линковки __stack_chk_guard
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
-        ccflags-y := -Wno-declaration-after-statement -Wno-unused-function
+        ccflags-y := -Wno-declaration-after-statement -Wno-unused-function -fno-stack-protector
         EOF
         
         echo 'source "drivers/khack/Kconfig"' >> drivers/Kconfig
@@ -80,20 +82,27 @@ jobs:
         # 1. Базовая конфигурация
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS gki_defconfig
         
-        # 2. Включение вашего модуля и обновление конфига
+        # 2. Модификация конфига
+        # Отключаем защиту стека в конфиге ядра, если она мешает (для 6.1 часто нужно)
+        ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_STRONG
+        ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_REGULAR
+        ./scripts/config --file out/.config --enable CONFIG_CC_STACKPROTECTOR_NONE
+        
+        # Включаем наш модуль
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         
-        # Для 6.1: отключаем некоторые проблемные опции, которые требуют vmlinux
+        # Отключаем BTF для 6.1 чтобы не требовался vmlinux и pahole не падал
         if [[ "${{ matrix.kernel_version }}" == "6.1" ]]; then
           echo "CONFIG_DEBUG_INFO_BTF=n" >> out/.config
+          echo "CONFIG_MODULE_ALLOW_BTF_MISMATCH=y" >> out/.config
         fi
         
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # 3. Подготовка к сборке модулей
+        # 3. Подготовка
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         
-        # 4. Сборка конкретно вашего модуля
+        # 4. Сборка модуля
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
 
     - name: Upload module
