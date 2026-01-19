@@ -1,4 +1,4 @@
-name: Build GKI Kernel Module
+name: Build GKI Kernel Module (No Vermagic)
 
 on:
   push:
@@ -16,7 +16,7 @@ jobs:
             android_branch: "android12-5.10"
             ndk_version: "r25c"
             ndk_url: "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
-            artifact_name: "jiangnight-5.10.136.ko"
+            artifact_name: "jiangnight-5.10.ko"
           
           - kernel_version: "6.1"
             android_branch: "android14-6.1"
@@ -59,9 +59,6 @@ jobs:
             default m
         EOF
         
-        # -fno-stack-protector: отключаем канарейку
-        # -mcmodel=large: иногда помогает при проблемах с адресацией, но обычно small/tiny достаточно для arm64.
-        # Оставим просто stack-protector off.
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
@@ -83,16 +80,12 @@ jobs:
         make O=out mrproper
         make O=out gki_defconfig
         
-        # --- Отключение проверок ---
+        # --- Максимальное отключение защит ---
         ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_STRONG
-        ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_REGULAR
         ./scripts/config --file out/.config --enable CONFIG_CC_STACKPROTECTOR_NONE
-        
-        # Отключаем контроль версий и CRC (важно для загрузки на другие сборки ядра)
         ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
         ./scripts/config --file out/.config --enable CONFIG_MODULE_FORCE_LOAD
         
-        # --- Включение модуля ---
         echo "CONFIG_KERNEL_HACK=m" >> out/.config
         
         if [[ "${{ matrix.kernel_version }}" == "6.1" ]]; then
@@ -102,12 +95,59 @@ jobs:
         
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
+        # --- ХАК: Пытаемся сделать версию пустой при сборке ---
+        # Очищаем .scmversion и пытаемся обмануть скрипты
+        echo "" > .scmversion
+        touch .scmversion
+        
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
         
-        # --- Стрипинг (опционально, но полезно) ---
-        # Уменьшаем размер и убираем отладочную инфу, которая может конфликтовать
-        llvm-strip --strip-debug out/drivers/khack/jiangnight.ko
+        # --- ХАК 2: Бинарное удаление vermagic из .ko ---
+        # Мы находим строку "vermagic=" и заменяем её на нули.
+        # Это опасный метод, но если insmod -f нет, это единственный шанс
+        # Работает так: ищем смещение "vermagic=", и затираем данные после него
+        
+        cd out/drivers/khack
+        
+        # Этот python-скрипт найдет секцию .modinfo и заменит vermagic на пустую строку (или занулит)
+        python3 -c '
+        import sys
+        
+        def patch_vermagic(filename):
+            with open(filename, "rb") as f:
+                data = bytearray(f.read())
+            
+            # Ищем маркер vermagic=
+            # В ядре 5.10/6.1 он обычно выглядит как "vermagic=X.Y.Z..."
+            marker = b"vermagic="
+            start = data.find(marker)
+            
+            if start == -1:
+                print(f"Vermagic marker not found in {filename}")
+                return
+            
+            print(f"Found vermagic at offset {start}")
+            
+            # Находим конец строки (null-byte)
+            end = data.find(b"", start)
+            if end == -1:
+                end = len(data)
+            
+            # Затираем версию: оставляем "vermagic=" но версию делаем пустой или нулями
+            # Вариант 1: Оставить "vermagic=" (пустая версия)
+            # data[start + len(marker)] = 0
+            
+            # Вариант 2 (Агрессивный): Забить всю строку нулями
+            for i in range(start, end):
+                data[i] = 0
+                
+            with open(filename, "wb") as f:
+                f.write(data)
+            print("Vermagic wiped!")
+
+        patch_vermagic("jiangnight.ko")
+        '
 
     - name: Upload module
       uses: actions/upload-artifact@v4
