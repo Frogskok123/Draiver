@@ -1,4 +1,4 @@
-name: Build GKI Kernel Module (No Vermagic)
+name: Build GKI Kernel Module (CFI Enabled)
 
 on:
   push:
@@ -20,6 +20,8 @@ jobs:
           
           - kernel_version: "6.1"
             android_branch: "android14-6.1"
+            # Ваша версия с телефона для подделки
+            fake_version: "6.1.57-android14-11-g792270e27ab1-ab11683491"
             ndk_version: "r27"
             ndk_url: "https://dl.google.com/android/repository/android-ndk-r27-linux.zip"
             artifact_name: "jiangnight-6.1.ko"
@@ -59,6 +61,7 @@ jobs:
             default m
         EOF
         
+        # Добавляем флаги для Shadow Call Stack (SCS) и CFI, если они нужны
         cat > drivers/khack/Makefile <<-'EOF'
         obj-$(CONFIG_KERNEL_HACK) += jiangnight.o
         jiangnight-objs := entry.o 
@@ -80,7 +83,16 @@ jobs:
         make O=out mrproper
         make O=out gki_defconfig
         
-        # --- Максимальное отключение защит ---
+        # --- ВКЛЮЧЕНИЕ CFI (для совместимости с GKI) ---
+        # GKI ядра (особенно 6.1) собраны с CFI_CLANG.
+        # Если модуль без CFI, он не сможет вызвать функции ядра (Exec format error или Crash).
+        ./scripts/config --file out/.config --enable CONFIG_CFI_CLANG
+        ./scripts/config --file out/.config --enable CONFIG_CFI_PERMISSIVE # Чтобы не крашило при ошибках
+        
+        # Также включаем Shadow Call Stack (SCS), часто используемый в Android
+        ./scripts/config --file out/.config --enable CONFIG_SHADOW_CALL_STACK
+        
+        # --- Отключение старых защит ---
         ./scripts/config --file out/.config --disable CONFIG_CC_STACKPROTECTOR_STRONG
         ./scripts/config --file out/.config --enable CONFIG_CC_STACKPROTECTOR_NONE
         ./scripts/config --file out/.config --disable CONFIG_MODVERSIONS
@@ -95,59 +107,16 @@ jobs:
         
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS olddefconfig
         
-        # --- ХАК: Пытаемся сделать версию пустой при сборке ---
-        # Очищаем .scmversion и пытаемся обмануть скрипты
-        echo "" > .scmversion
-        touch .scmversion
+        # --- ПОДДЕЛКА ВЕРСИИ (ОБЯЗАТЕЛЬНО) ---
+        if [ ! -z "${{ matrix.fake_version }}" ]; then
+            sed -i 's/^SUBLEVEL = .*/SUBLEVEL = 57/' Makefile
+            sed -i 's/^EXTRAVERSION = .*/EXTRAVERSION = -android14-11-g792270e27ab1-ab11683491/' Makefile
+            echo "" > .scmversion
+            touch .scmversion
+        fi
         
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) modules_prepare
         make O=out ARCH=$ARCH LLVM=$LLVM LLVM_IAS=$LLVM_IAS -j$(nproc) M=drivers/khack
-        
-        # --- ХАК 2: Бинарное удаление vermagic из .ko ---
-        # Мы находим строку "vermagic=" и заменяем её на нули.
-        # Это опасный метод, но если insmod -f нет, это единственный шанс
-        # Работает так: ищем смещение "vermagic=", и затираем данные после него
-        
-        cd out/drivers/khack
-        
-        # Этот python-скрипт найдет секцию .modinfo и заменит vermagic на пустую строку (или занулит)
-        python3 -c '
-        import sys
-        
-        def patch_vermagic(filename):
-            with open(filename, "rb") as f:
-                data = bytearray(f.read())
-            
-            # Ищем маркер vermagic=
-            # В ядре 5.10/6.1 он обычно выглядит как "vermagic=X.Y.Z..."
-            marker = b"vermagic="
-            start = data.find(marker)
-            
-            if start == -1:
-                print(f"Vermagic marker not found in {filename}")
-                return
-            
-            print(f"Found vermagic at offset {start}")
-            
-            # Находим конец строки (null-byte)
-            end = data.find(b"", start)
-            if end == -1:
-                end = len(data)
-            
-            # Затираем версию: оставляем "vermagic=" но версию делаем пустой или нулями
-            # Вариант 1: Оставить "vermagic=" (пустая версия)
-            # data[start + len(marker)] = 0
-            
-            # Вариант 2 (Агрессивный): Забить всю строку нулями
-            for i in range(start, end):
-                data[i] = 0
-                
-            with open(filename, "wb") as f:
-                f.write(data)
-            print("Vermagic wiped!")
-
-        patch_vermagic("jiangnight.ko")
-        '
 
     - name: Upload module
       uses: actions/upload-artifact@v4
